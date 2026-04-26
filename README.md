@@ -60,7 +60,7 @@ Example response:
   "label": "spam",
   "spam_probability": 0.94
 }
-
+```
 ---
 
 ## 4. Project Scope

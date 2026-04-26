@@ -1,6 +1,4 @@
-Dưới đây là **full file `README.md`** cho repo project của bạn. Copy nguyên khối này vào GitHub là được.
 
-````markdown
 # End-to-End Email Spam Classification
 
 ## 1. Project Overview
@@ -62,7 +60,6 @@ Example response:
   "label": "spam",
   "spam_probability": 0.94
 }
-````
 
 ---
 

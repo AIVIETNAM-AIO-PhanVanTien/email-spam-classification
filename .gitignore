@@ -7,9 +7,25 @@ __pycache__/
 *.so
 
 # Data
-data/raw/*
-!data/raw/.gitkeep
+data/*
+!data/raw/
+!data/bronze/
+!data/silver/
+!data/gold/
 
+data/raw/*
+data/bronze/*
+data/silver/*
+data/gold/*
+
+!data/raw/.gitkeep
+!data/bronze/.gitkeep
+!data/silver/.gitkeep
+!data/gold/.gitkeep
+
+# Models
+models/*
+!models/.gitkeep
 # Distribution / packaging
 .Python
 build/

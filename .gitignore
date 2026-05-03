@@ -7,8 +7,19 @@ __pycache__/
 *.so
 
 # Data
+<<<<<<< HEAD
 data/raw/*
 !data/raw/.gitkeep
+=======
+data/*
+!data/raw/.gitkeep
+!data/bronze/.gitkeep
+!data/silver/.gitkeep
+!data/gold/.gitkeep
+
+models/*
+!models/.gitkeep
+>>>>>>> 4824dda (push data and models)
 
 # Distribution / packaging
 .Python

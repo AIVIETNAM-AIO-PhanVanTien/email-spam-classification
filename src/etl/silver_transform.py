@@ -16,7 +16,7 @@ Pipeline:
     ④ Write parquet       — lưu Silver partition + quality report
 
 Chạy mỗi tháng bởi monthly_run.py:
-    py -m src.data.silver_transform --month YYYY-MM (Ví dụ: 2025-05)
+    py -m src.etl.silver_transform --month YYYY-MM (Ví dụ: 2025-05)
 """
 import re
 import json
@@ -26,10 +26,10 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, UTC
 
-from src.data.text_preprocessing import TextCleaner
-from src.data.data_quality_check import TextDataQuality
+from src.utils.text_preprocessing import TextCleaner
+from src.utils.data_quality_check import TextDataQuality
 
 BRONZE_DIR = Path("data/bronze")
 SILVER_DIR = Path("data/silver")
@@ -174,7 +174,7 @@ def run_quality_check(df: pd.DataFrame, month: str) -> tuple[pd.DataFrame, dict]
         "dropped_short_body": dropped_short,
         "dropped_null_label": dropped_null,
         "total_dropped":      initial_count - len(df),
-        "processed_at":       datetime.utcnow().isoformat(),
+        "processed_at":       datetime.now(UTC).isoformat(),
         "quality_metrics":    quality_metrics,
         "drift_flag":         label_dist.get("drift_flag", False),
     }

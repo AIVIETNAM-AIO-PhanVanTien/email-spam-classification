@@ -7,21 +7,10 @@ __pycache__/
 *.so
 
 # Data
-data/*
-!data/raw/
-!data/bronze/
-!data/silver/
-!data/gold/
 
-data/raw/*
-data/bronze/*
-data/silver/*
-data/gold/*
+data/**/*
 
-!data/raw/.gitkeep
-!data/bronze/.gitkeep
-!data/silver/.gitkeep
-!data/gold/.gitkeep
+!data/**/.gitkeep
 
 # Models
 models/*

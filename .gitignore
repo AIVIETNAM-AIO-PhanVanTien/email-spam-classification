@@ -8,9 +8,34 @@ __pycache__/
 
 # Data
 
-data/**/*
+data/*
 
-!data/**/.gitkeep
+!data/raw/
+!data/bronze/
+!data/silver/
+!data/gold/
+
+data/raw/*
+!data/raw/.gitkeep
+!data/raw/by_month/
+data/raw/by_month/*
+!data/raw/by_month/.gitkeep
+
+data/bronze/*
+!data/bronze/.gitkeep
+
+data/silver/*
+!data/silver/.gitkeep
+
+data/gold/*
+!data/gold/artifacts/
+!data/gold/full_load/
+
+data/gold/artifacts/*
+!data/gold/artifacts/.gitkeep
+
+data/gold/full_load/*
+!data/gold/full_load/.gitkeep
 
 # Models
 models/*

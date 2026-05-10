@@ -1,36 +1,24 @@
 """
-Gold layer — initial full load pipeline.
-Silver partitions (2025-05 → 2025-10) → feature selection → TF-IDF → train/val/test split → Gold parquet.
+Gold layer — full load pipeline (monthly-capable).
+Auto-discover Silver partitions → feature selection → TF-IDF → train/val/test split → Gold.
+
+Chạy:
+    py -m src.etl.gold_build --month YYYY-MM
+
+Ví dụ:
+    py -m src.etl.gold_build --month 2025-09
+    → Auto-discover tất cả Silver partitions ≤ 2025-09
+    → Holdout test = 2025-09 (tháng cuối)
+    → Train/val = tất cả tháng trước đó
 
 EDA Silver findings áp dụng:
-    Feature selection — bỏ 9 features redundant/vô nghĩa:
-        repetition_ratio    corr = -1.00 với unique_word_ratio
-        info_density        corr >  0.92 với complexity, unique_word_ratio
-        complexity          corr =  0.86 với repetition_ratio
-        spam_keyword_count  corr =  0.99 với char_count, word_count
-        log_words           corr =  0.99 với log_chars
-        has_escapenumber    MI   =  0.003, ham > spam → noise
-        question_count      distribution giống nhau 2 class
-        digit_ratio         distribution giống nhau 2 class
-        upper_ratio         distribution giống nhau 2 class
-
-    Giữ lại 4 numeric features có separation tốt nhất:
-        log_chars           đại diện độ dài email
-        avg_word_length     có separation spam vs ham
-        unique_word_ratio   đại diện vocabulary richness group
-        exclaim_count       punctuation signal
-
-    TF-IDF trên body_clean:
-        max_features=30,000  ngram_range=(1,2)  sublinear_tf=True
-        Fit 1 lần trên train set → save pkl → transform only cho tháng mới
-
-    Test set = tháng 2026-03 (holdout theo thời gian — realistic hơn random split)
+    Feature selection — bỏ 9 features redundant/vô nghĩa
+    Giữ lại 4 numeric features: log_chars, avg_word_length, unique_word_ratio, exclaim_count
+    TF-IDF trên body_clean: max_features=30,000  ngram_range=(1,2)  sublinear_tf=True
     Label ~50/50 → không cần class weighting
 
-Initial full load:
-    py -m src.etl.gold_build
-
 """
+import argparse
 import joblib
 import json
 import pandas as pd
@@ -45,16 +33,8 @@ from sklearn.preprocessing import StandardScaler
 
 SILVER_DIR   = Path("data/silver")
 GOLD_DIR     = Path("data/gold")
-ARTIFACT_DIR = GOLD_DIR / "artifacts"
 
 # ── Config ────────────────────────────────────────────────────────────────────
-INITIAL_MONTHS  = [
-    "2025-05", "2025-06", "2025-07",
-    "2025-08", "2025-09", "2025-10",
-    "2025-11", "2025-12", "2026-01",
-    "2026-02", "2026-03"
-]
-HOLDOUT_MONTH   = "2026-03"    # test set — tách theo thời gian
 VAL_SIZE        = 0.15         # 15% của trainval → val set
 RANDOM_STATE    = 42
 
@@ -111,6 +91,24 @@ def load_silver(months: list[str]) -> pd.DataFrame:
     return df
 
 
+def discover_silver_months(up_to: str) -> list[str]:
+    """
+    Scan data/silver/ cho tất cả month partitions có data_silver.parquet,
+    lọc chỉ giữ các tháng <= up_to.
+    Returns sorted list of month strings (YYYY-MM).
+    """
+    months = []
+    for p in SILVER_DIR.glob("month_partition=*"):
+        month = p.name.split("=")[1]
+        if month <= up_to and (p / "data_silver.parquet").exists():
+            months.append(month)
+    if not months:
+        raise FileNotFoundError(
+            f"Không tìm thấy Silver partition nào ≤ {up_to} trong {SILVER_DIR}"
+        )
+    return sorted(months)
+
+
 # ── Step 2: Feature selection ─────────────────────────────────────────────────
 def apply_feature_selection(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -138,14 +136,14 @@ def apply_feature_selection(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ── Step 3: Train / Val / Test split ─────────────────────────────────────────
-def split_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def split_dataset(df: pd.DataFrame, holdout_month: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Tách theo thời gian trước, sau đó random split trainval.
 
     Lý do tách theo thời gian thay vì random:
         - Realistic hơn: model train trên quá khứ, test trên tương lai
         - Tránh data leakage: email tháng holdout không lẫn vào train
-        - Holdout month = 2026-03 (tháng cuối initial load)
+        - Holdout month = tháng cuối (truyền qua --month)
 
     Sau đó random split trainval → train (85%) / val (15%)
     để val không bị bias theo thứ tự thời gian trong các tháng đầu.
@@ -153,8 +151,8 @@ def split_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.Data
     Cuối cùng assert email_id no-leak giữa 3 split để catch bug nếu
     sau này split logic thay đổi (vd random split nhầm).
     """
-    df_test    = df[df["month_partition"] == HOLDOUT_MONTH].copy()
-    df_trainval= df[df["month_partition"] != HOLDOUT_MONTH].copy()
+    df_test    = df[df["month_partition"] == holdout_month].copy()
+    df_trainval= df[df["month_partition"] != holdout_month].copy()
 
     df_train, df_val = train_test_split(
         df_trainval,
@@ -174,7 +172,7 @@ def split_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.Data
     print(f"  Train:    {len(df_train):,} rows | spam={df_train['label'].mean():.1%}")
     print(f"  Val:      {len(df_val):,} rows | spam={df_val['label'].mean():.1%}")
     print(f"  Test:     {len(df_test):,} rows | spam={df_test['label'].mean():.1%} "
-          f"(holdout month={HOLDOUT_MONTH})\n")
+          f"(holdout month={holdout_month})\n")
 
     return df_train, df_val, df_test
 
@@ -229,26 +227,28 @@ def build_features(
 
 
 # ── Step 5: Save artifacts ────────────────────────────────────────────────────
-def save_artifacts(vectorizer: TfidfVectorizer, scaler: StandardScaler):
+def save_artifacts(vectorizer: TfidfVectorizer, scaler: StandardScaler,
+                   months: list[str], holdout_month: str,
+                   snapshot_dir: Path):
     """
-    Save TF-IDF vectorizer + numeric scaler để monthly pipeline dùng transform only.
-    Không bao giờ fit lại trên data mới — để vector space nhất quán giữa
-    champion và challenger.
+    Save TF-IDF vectorizer + numeric scaler vào snapshot directory.
+    Monthly pipeline dùng transform only từ artifacts của snapshot tương ứng.
     """
-    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    artifact_dir = snapshot_dir / "artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
 
-    vec_path = ARTIFACT_DIR / "tfidf_vectorizer.pkl"
+    vec_path = artifact_dir / "tfidf_vectorizer.pkl"
     joblib.dump(vectorizer, vec_path)
     print(f"  Vectorizer saved → {vec_path}")
 
-    scaler_path = ARTIFACT_DIR / "numeric_scaler.pkl"
+    scaler_path = artifact_dir / "numeric_scaler.pkl"
     joblib.dump(scaler, scaler_path)
     print(f"  Scaler saved     → {scaler_path}")
 
-    # Save metadata để audit
     meta = {
         "fitted_at":        datetime.now(UTC).isoformat(),
-        "train_months":     [m for m in INITIAL_MONTHS if m != HOLDOUT_MONTH],
+        "train_months":     [m for m in months if m != holdout_month],
+        "holdout_month":    holdout_month,
         "vocab_size":       len(vectorizer.vocabulary_),
         "tfidf_config":     {k: str(v) for k, v in TFIDF_CONFIG.items()},
         "numeric_features": NUMERIC_FEATURES,
@@ -256,7 +256,7 @@ def save_artifacts(vectorizer: TfidfVectorizer, scaler: StandardScaler):
         "scaler_scale":     scaler.scale_.tolist(),
         "dropped_features": DROP_FEATURES,
     }
-    meta_path = ARTIFACT_DIR / "tfidf_metadata.json"
+    meta_path = artifact_dir / "tfidf_metadata.json"
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
     print(f"  Metadata saved   → {meta_path}\n")
@@ -267,43 +267,35 @@ def write_gold_split(
     df:     pd.DataFrame,
     X,                          # sparse matrix
     split:  str,                # "train" | "val" | "test"
+    snapshot_dir: Path,
 ):
     """
-    Lưu Gold split: metadata + numeric features ở Parquet, TF-IDF sparse
-    riêng ở `.npz` (scipy `save_npz`).
-
-    Tránh ghi dense 30k cột vào parquet — sẽ phồng lên ~6GB toàn 0
-    (TF-IDF với max_features=30k × 50k rows × dense = ~6GB; sparse npz
-    chỉ vài chục MB vì 99% là 0).
-
-    Label đã có trong parquet → KHÔNG lưu `_y.npy` để tránh duplicate.
-    Khi train: load label từ `parquet["label"]`.
+    Lưu Gold split vào snapshot_dir/full_load/.
+    Metadata + numeric (raw) ở Parquet, TF-IDF sparse ở `.npz`.
     """
-    out_dir = GOLD_DIR / "full_load"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    full_load_dir = snapshot_dir / "full_load"
+    full_load_dir.mkdir(parents=True, exist_ok=True)
 
-    # Parquet: email_id + label + month + numeric (đã scale chưa? — KHÔNG, parquet
-    # giữ raw numeric cho audit; X.npz mới là numeric đã scale)
     meta_cols = ["email_id", "label", "month_partition"] + NUMERIC_FEATURES
     df_out = df[meta_cols].reset_index(drop=True)
     pq.write_table(
         pa.Table.from_pandas(df_out),
-        out_dir / f"{split}.parquet",
+        full_load_dir / f"{split}.parquet",
         compression="snappy",
     )
 
-    # Sparse matrix (TF-IDF + numeric scaled)
-    save_npz(str(out_dir / f"{split}_X.npz"), X)
+    save_npz(str(full_load_dir / f"{split}_X.npz"), X)
 
-    print(f"  Gold {split} saved → {out_dir / split}.parquet + {split}_X.npz")
+    print(f"  Gold {split} saved → {full_load_dir / split}.parquet + {split}_X.npz")
 
 
-def write_gold_build_log(df_train, df_val, df_test, vectorizer, scaler):
+def write_gold_build_log(df_train, df_val, df_test, vectorizer, scaler,
+                         months, holdout_month, snapshot_dir: Path):
     """Ghi log tổng kết gold build để audit."""
     log = {
         "built_at":          datetime.now(UTC).isoformat(),
-        "initial_months":    INITIAL_MONTHS,
-        "holdout_month":     HOLDOUT_MONTH,
+        "months":            months,
+        "holdout_month":     holdout_month,
         "train_rows":        len(df_train),
         "val_rows":          len(df_val),
         "test_rows":         len(df_test),
@@ -317,57 +309,92 @@ def write_gold_build_log(df_train, df_val, df_test, vectorizer, scaler):
         "dropped_features":  DROP_FEATURES,
         "tfidf_config":      {k: str(v) for k, v in TFIDF_CONFIG.items()},
     }
-    log_path = GOLD_DIR / "full_load" / "_build_log.json"
+    log_path = snapshot_dir / "full_load" / "_build_log.json"
     with open(log_path, "w") as f:
         json.dump(log, f, indent=2)
     print(f"  Build log saved → {log_path}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-def build():
-    # Idempotent guard
-    if (GOLD_DIR / "full_load" / "train.parquet").exists():
-        print("[SKIP] Gold full_load đã tồn tại. Xóa thư mục để build lại.")
-        return
+def build(month: str):
+    """
+    Full load gold build tới tháng chỉ định.
+    Auto-discover silver partitions ≤ month, dùng month làm holdout test.
+    Output: data/gold/snapshot=YYYY-MM/ (self-contained, không ghi đè tháng khác).
+    """
+    holdout_month = month
+    all_months = discover_silver_months(month)
+
+    if holdout_month not in all_months:
+        raise ValueError(
+            f"Silver partition cho tháng {holdout_month} không tồn tại. "
+            f"Chạy bronze + silver trước."
+        )
+
+    if len(all_months) < 2:
+        raise ValueError(
+            f"Cần ít nhất 2 tháng silver để split train/test "
+            f"(hiện có {len(all_months)}). Chạy thêm bronze + silver."
+        )
+
+    # Snapshot directory cho tháng này
+    snapshot_dir = GOLD_DIR / f"snapshot={holdout_month}"
+    if snapshot_dir.exists():
+        import shutil
+        shutil.rmtree(snapshot_dir)
+        print(f"[INFO] Xóa snapshot cũ {snapshot_dir.name} để rebuild.\n")
 
     print("=" * 60)
-    print("GOLD BUILD — Initial Full Load")
-    print(f"Months: {INITIAL_MONTHS[0]} → {INITIAL_MONTHS[-1]}")
-    print(f"Holdout test: {HOLDOUT_MONTH}")
+    print(f"GOLD BUILD — Snapshot {holdout_month}")
+    print(f"Months: {all_months[0]} → {all_months[-1]} ({len(all_months)} tháng)")
+    print(f"Holdout test: {holdout_month}")
     print("=" * 60)
 
     # ── Pipeline ──────────────────────────────────────────────────────────────
     print("\n[1/6] Loading Silver partitions...")
-    df = load_silver(INITIAL_MONTHS)
+    df = load_silver(all_months)
 
     print("[2/6] Applying feature selection...")
     df = apply_feature_selection(df)
 
     print("[3/6] Splitting train / val / test...")
-    df_train, df_val, df_test = split_dataset(df)
+    df_train, df_val, df_test = split_dataset(df, holdout_month)
 
     print("[4/6] Building TF-IDF + scaler...")
-    vectorizer, scaler, X_train, X_val, X_test = build_features(df_train, df_val, df_test)
+    vectorizer, scaler, X_train, X_val, X_test = build_features(
+        df_train, df_val, df_test
+    )
 
     print("[5/6] Saving artifacts...")
-    save_artifacts(vectorizer, scaler)
+    save_artifacts(vectorizer, scaler, all_months, holdout_month, snapshot_dir)
 
     print("[6/6] Writing Gold partitions...")
-    write_gold_split(df_train, X_train, "train")
-    write_gold_split(df_val,   X_val,   "val")
-    write_gold_split(df_test,  X_test,  "test")
-    write_gold_build_log(df_train, df_val, df_test, vectorizer, scaler)
+    write_gold_split(df_train, X_train, "train", snapshot_dir)
+    write_gold_split(df_val,   X_val,   "val",   snapshot_dir)
+    write_gold_split(df_test,  X_test,  "test",  snapshot_dir)
+    write_gold_build_log(
+        df_train, df_val, df_test, vectorizer, scaler,
+        all_months, holdout_month, snapshot_dir
+    )
 
-    print("\n[DONE] Gold full_load build complete.")
-    print(f"  → data/gold/full_load/")
-    print(f"     train.parquet + train_X.npz")
-    print(f"     val.parquet   + val_X.npz")
-    print(f"     test.parquet  + test_X.npz")
-    print(f"  → data/gold/artifacts/")
-    print(f"     tfidf_vectorizer.pkl")
-    print(f"     numeric_scaler.pkl")
-    print(f"     tfidf_metadata.json")
+    print(f"\n[DONE] Gold snapshot={holdout_month} build complete.")
+    print(f"  → {snapshot_dir}/")
+    print(f"     full_load/train.parquet + train_X.npz")
+    print(f"     full_load/val.parquet   + val_X.npz")
+    print(f"     full_load/test.parquet  + test_X.npz")
+    print(f"     full_load/_build_log.json")
+    print(f"     artifacts/tfidf_vectorizer.pkl")
+    print(f"     artifacts/numeric_scaler.pkl")
+    print(f"     artifacts/tfidf_metadata.json")
 
 
 if __name__ == "__main__":
-    build()
+    parser = argparse.ArgumentParser(
+        description="Gold full load — build train/val/test từ Silver partitions"
+    )
+    parser.add_argument(
+        "--month", required=True,
+        help="Tháng holdout/test (YYYY-MM). Gold sẽ load tất cả silver ≤ tháng này."
+    )
+    args = parser.parse_args()
+    build(args.month)

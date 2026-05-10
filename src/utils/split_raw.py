@@ -2,7 +2,7 @@
 Split emails.csv gốc → data/raw/emails_YYYY-MM.csv
 Phần dư < 50% ROWS_PER_MONTH sẽ gộp vào tháng cuối.
 
-Chạy: py -m src.data.split_raw
+Chạy: py -m src.utils.split_raw
 
 """
 import pandas as pd
@@ -11,8 +11,8 @@ from pathlib import Path
 RAW_CSV        = Path("data/raw/spam_Emails_data.csv")
 RAW_DIR        = Path("data/raw/by_month")
 ROWS_PER_MONTH = 10_000
-BASE_YEAR      = 2025
-BASE_MONTH     = 5
+BASE_YEAR      = 2024
+BASE_MONTH     = 11
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = df.columns.str.strip().str.lower()

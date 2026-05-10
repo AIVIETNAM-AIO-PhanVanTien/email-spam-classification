@@ -11,14 +11,14 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 from dateutil.relativedelta import relativedelta
 import argparse
 
 BRONZE_DIR     = Path("data/bronze")
 RAW_DIR        = Path("data/raw/by_month")
 ROWS_PER_MONTH = 10_000
-BASE_MONTH     = datetime(2025, 5, 1)
+BASE_MONTH     = datetime(2024, 11, 1)
 SEED           = 42
 
 def inject_received_at(df: pd.DataFrame, month: str) -> pd.DataFrame:
@@ -90,7 +90,7 @@ def ingest(month: str):
         "ham_count":        int((df["label"] == 0).sum()),
         "min_received_at":  df["received_at"].min(),
         "max_received_at":  df["received_at"].max(),
-        "ingested_at":      datetime.utcnow(),
+        "ingested_at":      datetime.now(UTC),
         "source_file":      raw_path.name,
     }])
     header = not log_path.exists()

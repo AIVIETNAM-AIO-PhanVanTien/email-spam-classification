@@ -1,201 +1,338 @@
-import os
-import json
-import pickle
-import datetime
-import re
+"""
+Gold layer — initial full load pipeline.
+Silver partitions (2025-05 → 2025-10) → feature selection → TF-IDF → train/val/test split → Gold parquet.
 
+EDA Silver findings áp dụng:
+    Feature selection — bỏ 9 features redundant/vô nghĩa:
+        repetition_ratio    corr = -1.00 với unique_word_ratio
+        info_density        corr >  0.92 với complexity, unique_word_ratio
+        complexity          corr =  0.86 với repetition_ratio
+        spam_keyword_count  corr =  0.99 với char_count, word_count
+        log_words           corr =  0.99 với log_chars
+        has_escapenumber    MI   =  0.003, ham > spam → noise
+        question_count      distribution giống nhau 2 class
+        digit_ratio         distribution giống nhau 2 class
+        upper_ratio         distribution giống nhau 2 class
+
+    Giữ lại 4 numeric features có separation tốt nhất:
+        log_chars           đại diện độ dài email
+        avg_word_length     có separation spam vs ham
+        unique_word_ratio   đại diện vocabulary richness group
+        exclaim_count       punctuation signal
+
+    TF-IDF trên body_clean:
+        max_features=30,000  ngram_range=(1,2)  sublinear_tf=True
+        Fit 1 lần trên train set → save pkl → transform only cho tháng mới
+
+    Test set = tháng 2026-03 (holdout theo thời gian — realistic hơn random split)
+    Label ~50/50 → không cần class weighting
+
+Initial full load:
+    py -m src.etl.gold_build
+
+"""
+import joblib
+import json
+import argparse
 import numpy as np
 import pandas as pd
-from scipy import sparse
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pyarrow.dataset as ds
+from pathlib import Path
+from datetime import datetime
+from scipy.sparse import hstack, save_npz
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
-from pathlib import Path
+
+SILVER_DIR   = Path("data/silver")
+GOLD_DIR     = Path("data/gold")
+ARTIFACT_DIR = GOLD_DIR / "artifacts"
+
+# ── Config ────────────────────────────────────────────────────────────────────
+INITIAL_MONTHS  = [
+    "2025-05", "2025-06", "2025-07",
+    "2025-08", "2025-09", "2025-10",
+    "2025-11", "2025-12", "2026-01",
+    "2026-02", "2026-03"
+]
+HOLDOUT_MONTH   = "2026-03"    # test set — tách theo thời gian
+VAL_SIZE        = 0.15         # 15% của trainval → val set
+RANDOM_STATE    = 42
+
+# ── Feature selection (kết quả EDA Silver) ───────────────────────────────────
+# Bỏ: corr > 0.86, MI thấp, distribution không phân tách được
+DROP_FEATURES = [
+    "repetition_ratio",     # corr = -1.00 với unique_word_ratio
+    "info_density",         # corr >  0.92 với complexity, unique_word_ratio
+    "complexity",           # corr =  0.86 với repetition_ratio
+    "spam_keyword_count",   # corr =  0.99 với char_count, word_count
+    "log_words",            # corr =  0.99 với log_chars
+    "has_escapenumber",     # MI = 0.003, ham (0.74) > spam (0.67) → noise
+    "question_count",       # distribution giống nhau 2 class
+    "digit_ratio",          # distribution giống nhau 2 class
+    "upper_ratio",          # distribution giống nhau 2 class
+]
+
+# Giữ lại — đã xác nhận có separation qua EDA
+NUMERIC_FEATURES = [
+    "log_chars",            # đại diện độ dài (thay cho char_count, word_count, log_words)
+    "avg_word_length",      # spam tập trung 7-8, ham rải rộng hơn
+    "unique_word_ratio",    # đại diện vocabulary richness group
+    "exclaim_count",        # punctuation signal
+]
+
+# TF-IDF config
+TFIDF_CONFIG = {
+    "max_features": 30_000,
+    "ngram_range":  (1, 2),   # unigram + bigram: bắt được "click here", "act now"
+    "min_df":       5,        # bỏ token xuất hiện < 5 docs
+    "max_df":       0.95,     # bỏ token xuất hiện > 95% docs
+    "sublinear_tf": True,     # log(tf) — giảm ảnh hưởng email rất dài
+}
 
 
-# Label encoding
-def encode_labels(df: pd.DataFrame, label_col: str = 'label'):
+# ── Step 1: Load Silver ───────────────────────────────────────────────────────
+def load_silver(months: list[str]) -> pd.DataFrame:
     """
-    Encode label ham/spam → 0/1.
-    Trả về df đã có cột label_encoded và LabelEncoder đã fit.
+    Load Silver partitions theo danh sách tháng chỉ định.
+    Dùng pyarrow dataset để đọc hiệu quả, không load toàn bộ Silver.
     """
-    le = LabelEncoder()
-    df['label_encoded'] = le.fit_transform(df[label_col])
-    # In ra để xác nhận mapping (ham=0, spam=1 hay ngược lại)
-    mapping = dict(zip(le.classes_, le.transform(le.classes_).tolist()))
-    print(f"  Label mapping: {mapping}")
-    return df, le
+    frames = []
+    for month in months:
+        path = SILVER_DIR / f"month_partition={month}" / "data_silver.parquet"
+        if not path.exists():
+            raise FileNotFoundError(f"Silver partition không tồn tại: {path}")
+        df = pq.read_table(path).to_pandas()
+        df["month_partition"] = month
+        frames.append(df)
+        print(f"  Loaded {month}: {len(df):,} rows")
+
+    df = pd.concat(frames, ignore_index=True)
+    print(f"  Total: {len(df):,} rows | {df['label'].mean():.1%} spam\n")
+    return df
 
 
-# Train/Test split
-def split_data(df: pd.DataFrame, test_size: float = 0.2, random_state: int = 42):
+# ── Step 2: Feature selection ─────────────────────────────────────────────────
+def apply_feature_selection(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Stratified split để đảm bảo tỉ lệ spam/ham cân bằng ở cả 2 tập.
-    Seed cố định để tất cả notebooks dùng cùng một split.
+    Bỏ các features đã xác định không có giá trị qua EDA Silver.
+    Log ra để audit — quan trọng khi review lại sau này.
     """
-    train_df, test_df = train_test_split(
-        df,
-        test_size=test_size,
-        random_state=random_state,
-        stratify=df['label_encoded']
+    existing_drops = [f for f in DROP_FEATURES if f in df.columns]
+    df = df.drop(columns=existing_drops)
+
+    print(f"  Dropped {len(existing_drops)} features: {existing_drops}")
+    print(f"  Numeric features kept: {NUMERIC_FEATURES}")
+    print(f"  Remaining cols: {len(df.columns)}\n")
+    return df
+
+
+# ── Step 3: Train / Val / Test split ─────────────────────────────────────────
+def split_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Tách theo thời gian trước, sau đó random split trainval.
+
+    Lý do tách theo thời gian thay vì random:
+        - Realistic hơn: model train trên quá khứ, test trên tương lai
+        - Tránh data leakage: email tháng 10 không lẫn vào train
+        - Holdout month = 2025-10 (tháng cuối initial load)
+
+    Sau đó random split trainval → train (85%) / val (15%)
+    để val không bị bias theo thứ tự thời gian trong các tháng đầu.
+    """
+    df_test    = df[df["month_partition"] == HOLDOUT_MONTH].copy()
+    df_trainval= df[df["month_partition"] != HOLDOUT_MONTH].copy()
+
+    df_train, df_val = train_test_split(
+        df_trainval,
+        test_size=VAL_SIZE,
+        stratify=df_trainval["label"],
+        random_state=RANDOM_STATE,
     )
-    train_df = train_df.reset_index(drop=True)
-    test_df  = test_df.reset_index(drop=True)
-    return train_df, test_df
 
-def standardize_numbers(text):
-    if not isinstance(text, str):
-        return ""
-    text = re.sub(r'\w*escapenumber\w*', 'escapenumber', text)
-    text = re.sub(r'\w*escapelong\w*',   'escapelong',   text)
-    return text
+    print(f"  Train:    {len(df_train):,} rows | spam={df_train['label'].mean():.1%}")
+    print(f"  Val:      {len(df_val):,} rows | spam={df_val['label'].mean():.1%}")
+    print(f"  Test:     {len(df_test):,} rows | spam={df_test['label'].mean():.1%} "
+          f"(holdout month={HOLDOUT_MONTH})\n")
 
-# TF-IDF VECTORIZATION
-def build_tfidf(train_df: pd.DataFrame, test_df: pd.DataFrame,
-                max_features: int = 10000, ngram_range: tuple = (1, 2)):
-    
-    print("  Applying regex standardization for numbers...")
-    train_df['processed_text'] = train_df['processed_text'].apply(standardize_numbers)
-    test_df['processed_text'] = test_df['processed_text'].apply(standardize_numbers)
-    
-    # Khởi tạo Vectorizer như bình thường
-    vectorizer = TfidfVectorizer(
-        max_features=max_features,
-        ngram_range=ngram_range,
-        sublinear_tf=True,
-        strip_accents='unicode',
-        min_df=2,
-    )
-
-    X_train_tfidf = vectorizer.fit_transform(train_df['processed_text'])
-    X_test_tfidf  = vectorizer.transform(test_df['processed_text'])
-
-    return vectorizer, X_train_tfidf, X_test_tfidf
+    return df_train, df_val, df_test
 
 
+# ── Step 4: TF-IDF vectorization ──────────────────────────────────────────────
+def build_tfidf(
+    df_train: pd.DataFrame,
+    df_val:   pd.DataFrame,
+    df_test:  pd.DataFrame,
+) -> tuple:
+    """
+    Fit TF-IDF trên train set → transform val và test.
 
-# SAVE ARTIFACTS
-def save_artifacts(
-    train_df, test_df,
-    vectorizer, le,
-    X_train_tfidf, X_test_tfidf,
-    output_dir: str,
-    model_dir: str
-):
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(model_dir, exist_ok=True)
+    Quan trọng:
+        - Chỉ fit trên train — không được nhìn thấy val/test
+        - Save vectorizer pkl → monthly pipeline dùng transform only
+        - Kết hợp TF-IDF sparse matrix với numeric features (hstack)
 
-    # Parquet — full dataframe (text + statistical features + label)
-    train_df.to_parquet(os.path.join(output_dir, 'train.parquet'), index=False)
-    test_df.to_parquet(os.path.join(output_dir, 'test.parquet'),   index=False)
-    print(f"  Saved train.parquet ({len(train_df)} rows)")
-    print(f"  Saved test.parquet  ({len(test_df)} rows)")
+    Output shape:
+        X_train: (n_train, 30000 + 4)  — sparse matrix
+        X_val:   (n_val,   30000 + 4)
+        X_test:  (n_test,  30000 + 4)
+    """
+    print("  Fitting TF-IDF on train set...")
+    vectorizer = TfidfVectorizer(**TFIDF_CONFIG)
+    X_train_text = vectorizer.fit_transform(df_train["body_clean"])
+    X_val_text   = vectorizer.transform(df_val["body_clean"])
+    X_test_text  = vectorizer.transform(df_test["body_clean"])
 
-    # TF-IDF sparse matrices
-    sparse.save_npz(os.path.join(output_dir, 'X_train_tfidf.npz'), X_train_tfidf)
-    sparse.save_npz(os.path.join(output_dir, 'X_test_tfidf.npz'),  X_test_tfidf)
-    print(f"  Saved X_train_tfidf.npz {X_train_tfidf.shape}")
-    print(f"  Saved X_test_tfidf.npz  {X_test_tfidf.shape}")
+    print(f"  Vocabulary size: {len(vectorizer.vocabulary_):,} tokens")
+    print(f"  X_train_text shape: {X_train_text.shape}")
 
-    # TF-IDF vectorizer
-    vectorizer_path = os.path.join(model_dir, 'tfidf_vectorizer.pkl')
-    with open(vectorizer_path, 'wb') as f:
-        pickle.dump(vectorizer, f)
-    print(f"  Saved tfidf_vectorizer.pkl")
+    # Numeric features
+    X_train_num = df_train[NUMERIC_FEATURES].fillna(0).values
+    X_val_num   = df_val[NUMERIC_FEATURES].fillna(0).values
+    X_test_num  = df_test[NUMERIC_FEATURES].fillna(0).values
 
-    # Label encoder
-    le_path = os.path.join(model_dir, 'label_encoder.pkl')
-    with open(le_path, 'wb') as f:
-        pickle.dump(le, f)
-    print(f"  Saved label_encoder.pkl")
+    # Combine text + numeric
+    from scipy.sparse import csr_matrix
+    X_train = hstack([X_train_text, csr_matrix(X_train_num)])
+    X_val   = hstack([X_val_text,   csr_matrix(X_val_num)])
+    X_test  = hstack([X_test_text,  csr_matrix(X_test_num)])
 
-    # Feature names (dùng để debug / interpret model)
-    feature_names = {
-        'tfidf_features': vectorizer.get_feature_names_out().tolist(),
+    print(f"  Final X_train shape: {X_train.shape}")
+    print(f"  Final X_val shape:   {X_val.shape}")
+    print(f"  Final X_test shape:  {X_test.shape}\n")
+
+    return vectorizer, X_train, X_val, X_test
+
+
+# ── Step 5: Save artifacts ────────────────────────────────────────────────────
+def save_vectorizer(vectorizer: TfidfVectorizer):
+    """
+    Save TF-IDF vectorizer để monthly pipeline dùng transform only.
+    Không bao giờ fit lại vectorizer trên data mới —
+    để vocabulary nhất quán giữa champion và challenger.
+    """
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    path = ARTIFACT_DIR / "tfidf_vectorizer.pkl"
+    joblib.dump(vectorizer, path)
+    print(f"  Vectorizer saved → {path}")
+
+    # Save metadata để audit
+    meta = {
+        "fitted_at":      datetime.utcnow().isoformat(),
+        "train_months":   [m for m in INITIAL_MONTHS if m != HOLDOUT_MONTH],
+        "vocab_size":     len(vectorizer.vocabulary_),
+        "tfidf_config":   {k: str(v) for k, v in TFIDF_CONFIG.items()},
+        "numeric_features": NUMERIC_FEATURES,
+        "dropped_features": DROP_FEATURES,
     }
-    with open(os.path.join(output_dir, 'feature_names.json'), 'w') as f:
-        json.dump(feature_names, f, indent=2)
-
-    # Metadata
-    label_mapping = dict(zip(le.classes_, le.transform(le.classes_).tolist()))
-    class_dist    = train_df['label'].value_counts().to_dict()
-
-    metadata = {
-        'created_at':         datetime.datetime.now().isoformat(),
-        'train_size':         len(train_df),
-        'test_size':          len(test_df),
-        'tfidf_vocab_size':   len(vectorizer.vocabulary_),
-        'tfidf_max_features': vectorizer.max_features,
-        'tfidf_ngram_range':  list(vectorizer.ngram_range),
-        'label_mapping':      label_mapping,
-        'train_class_distribution': class_dist,
-    }
-    with open(os.path.join(output_dir, 'gold_metadata.json'), 'w') as f:
-        json.dump(metadata, f, indent=2, ensure_ascii=False)
-    print(f"  Saved gold_metadata.json")
+    with open(ARTIFACT_DIR / "tfidf_metadata.json", "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"  Metadata saved → {ARTIFACT_DIR / 'tfidf_metadata.json'}\n")
 
 
-# MAIN PIPELINE
-def build_gold(
-    input_path:   str,
-    output_dir:   str,
-    model_dir:    str,
-    test_size:    float = 0.2,
-    random_state: int   = 42,
-    tfidf_max_features: int   = 10000,
-    tfidf_ngram_range:  tuple = (1, 2),
+# ── Step 6: Write Gold parquet ────────────────────────────────────────────────
+def write_gold_split(
+    df:     pd.DataFrame,
+    X,                          # sparse matrix
+    split:  str,                # "train" | "val" | "test"
 ):
+    """
+    Lưu Gold split ra Parquet.
+    Lưu dạng dense vì sparse Parquet cần thư viện đặc biệt.
+    Chỉ lưu: email_id, label, numeric features, và TF-IDF dense (nén snappy).
 
-    # Load silver
-    print("\n[1/4] Loading silver data...")
-    df = pd.read_parquet(input_path)
-    print(f"  Loaded {len(df)} rows | Columns: {df.columns.tolist()}")
+    Note: TF-IDF 30k features × 50k rows = ~6GB nếu dense.
+    → Chỉ lưu numeric + metadata, X sparse lưu riêng bằng scipy.
+    """
+    out_dir = GOLD_DIR / "full_load"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-
-    # Encode labels
-    print("\n[2/4] Encoding labels...")
-    df, le = encode_labels(df)
-
-    # Split
-    print("\n[3/4] Splitting train/test...")
-    train_df, test_df = split_data(df, test_size=test_size, random_state=random_state)
-    print(f"  Train: {len(train_df)} | Test: {len(test_df)}")
-    print(f"  Train spam ratio: {train_df['label_encoded'].mean():.2%}")
-    print(f"  Test  spam ratio: {test_df['label_encoded'].mean():.2%}")
-
-    # TF-IDF
-    print("\n[4/4] Building TF-IDF...")
-    vectorizer, X_train_tfidf, X_test_tfidf = build_tfidf(
-        train_df, test_df,
-        max_features=tfidf_max_features,
-        ngram_range=tfidf_ngram_range
-    )
-    print(f"  Vocab size: {len(vectorizer.vocabulary_)}")
-
-    # Save
-    print("\n[+] Saving artifacts...")
-    save_artifacts(
-        train_df, test_df,
-        vectorizer, le,
-        X_train_tfidf, X_test_tfidf,
-        output_dir, model_dir
+    # Lưu label + numeric + metadata vào Parquet
+    meta_cols = ["email_id", "label", "month_partition"] + NUMERIC_FEATURES
+    df_out = df[meta_cols].reset_index(drop=True)
+    pq.write_table(
+        pa.Table.from_pandas(df_out),
+        out_dir / f"{split}.parquet",
+        compression="snappy",
     )
 
-    print("Gold Layer complete")
+    # Lưu sparse matrix riêng (nhẹ hơn nhiều so với dense)
+    save_npz(str(out_dir / f"{split}_X.npz"), X)
+
+    # Lưu labels riêng cho sklearn compatibility
+    np.save(str(out_dir / f"{split}_y.npy"), df["label"].values)
+
+    print(f"  Gold {split} saved → {out_dir / split}.parquet + {split}_X.npz")
 
 
+def write_gold_build_log(df_train, df_val, df_test, vectorizer):
+    """Ghi log tổng kết gold build để audit."""
+    log = {
+        "built_at":          datetime.utcnow().isoformat(),
+        "initial_months":    INITIAL_MONTHS,
+        "holdout_month":     HOLDOUT_MONTH,
+        "train_rows":        len(df_train),
+        "val_rows":          len(df_val),
+        "test_rows":         len(df_test),
+        "train_spam_ratio":  round(float(df_train["label"].mean()), 4),
+        "val_spam_ratio":    round(float(df_val["label"].mean()), 4),
+        "test_spam_ratio":   round(float(df_test["label"].mean()), 4),
+        "tfidf_vocab_size":  len(vectorizer.vocabulary_),
+        "numeric_features":  NUMERIC_FEATURES,
+        "dropped_features":  DROP_FEATURES,
+        "tfidf_config":      {k: str(v) for k, v in TFIDF_CONFIG.items()},
+    }
+    log_path = GOLD_DIR / "full_load" / "_build_log.json"
+    with open(log_path, "w") as f:
+        json.dump(log, f, indent=2)
+    print(f"  Build log saved → {log_path}")
 
-# ENTRY POINT
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def build():
+    # Idempotent guard
+    if (GOLD_DIR / "full_load" / "train.parquet").exists():
+        print("[SKIP] Gold full_load đã tồn tại. Xóa thư mục để build lại.")
+        return
+
+    print("=" * 60)
+    print("GOLD BUILD — Initial Full Load")
+    print(f"Months: {INITIAL_MONTHS[0]} → {INITIAL_MONTHS[-1]}")
+    print(f"Holdout test: {HOLDOUT_MONTH}")
+    print("=" * 60)
+
+    # ── Pipeline ──────────────────────────────────────────────────────────────
+    print("\n[1/6] Loading Silver partitions...")
+    df = load_silver(INITIAL_MONTHS)
+
+    print("[2/6] Applying feature selection...")
+    df = apply_feature_selection(df)
+
+    print("[3/6] Splitting train / val / test...")
+    df_train, df_val, df_test = split_dataset(df)
+
+    print("[4/6] Building TF-IDF...")
+    vectorizer, X_train, X_val, X_test = build_tfidf(df_train, df_val, df_test)
+
+    print("[5/6] Saving artifacts...")
+    save_vectorizer(vectorizer)
+
+    print("[6/6] Writing Gold partitions...")
+    write_gold_split(df_train, X_train, "train")
+    write_gold_split(df_val,   X_val,   "val")
+    write_gold_split(df_test,  X_test,  "test")
+    write_gold_build_log(df_train, df_val, df_test, vectorizer)
+
+    print("\n[DONE] Gold full_load build complete.")
+    print(f"  → data/gold/full_load/")
+    print(f"     train.parquet + train_X.npz + train_y.npy")
+    print(f"     val.parquet   + val_X.npz   + val_y.npy")
+    print(f"     test.parquet  + test_X.npz  + test_y.npy")
+    print(f"  → data/gold/artifacts/")
+    print(f"     tfidf_vectorizer.pkl")
+    print(f"     tfidf_metadata.json")
+
+
 if __name__ == "__main__":
-    current_script_path = Path(__file__).resolve()
-    project_root = current_script_path.parent.parent.parent
-    build_gold(
-        input_path          = project_root / "data" / "silver" / "emails_silver.parquet",
-        output_dir          = project_root / "data" / "gold",
-        model_dir           = project_root / "models",
-        test_size           = 0.2,
-        random_state        = 42,
-        tfidf_max_features  = 10000,
-        tfidf_ngram_range   = (1, 2),
-
-    )
+    build()

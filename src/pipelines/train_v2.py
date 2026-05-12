@@ -9,7 +9,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.naive_bayes import MultinomialNB
 from xgboost import XGBClassifier
 
-from src.pipelines.evaluate import evaluate, load_split, pick_threshold
+from src.pipelines.evaluate_v2 import evaluate, load_split, pick_threshold
 
 GOLD_DIR = Path("data/gold")
 MODEL_DIR = Path("models")

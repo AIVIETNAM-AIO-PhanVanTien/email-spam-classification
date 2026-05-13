@@ -77,9 +77,9 @@ def evaluate(y_true, y_prob, threshold: float) -> dict:
 def _resolve_threshold(arg_threshold: float | None) -> float:
     if arg_threshold is not None:
         return arg_threshold
-    meta_path = MODEL_DIR / "metadata.json"
+    meta_path = MODEL_DIR / "train.json"
     if not meta_path.exists():
-        raise FileNotFoundError("No metadata.json found. Please pass --threshold directly.")
+        raise FileNotFoundError("No train.json found. Please pass --threshold directly.")
     meta = json.loads(meta_path.read_text())
     return float(meta["threshold"])
 
@@ -106,9 +106,11 @@ def main():
     parser.add_argument("--threshold", type=float, default=None, help="Override threshold")
     args = parser.parse_args()
 
-    model_path = MODEL_DIR / "best_model.pkl"
-    vec_path = MODEL_DIR / "vectorizer.pkl"
-    scaler_path = MODEL_DIR / "scaler.pkl"
+    model_path = MODEL_DIR / "best_spam_classifier.pkl"
+    meta = json.loads((MODEL_DIR / "train.json").read_text())
+    snapshot = meta["snapshot"]
+    vec_path = GOLD_DIR / f"snapshot={snapshot}" / "artifacts" / "tfidf_vectorizer.pkl"
+    scaler_path = GOLD_DIR / f"snapshot={snapshot}" / "artifacts" / "numeric_scaler.pkl"
 
     if not all(p.exists() for p in [model_path, vec_path, scaler_path]):
         raise FileNotFoundError("Missing model artifacts. Run train.py first.")
@@ -149,7 +151,7 @@ def main():
         "metrics": metrics,
         "n_rows": int(X_test.shape[0]),
     }
-    out_path = MODEL_DIR / f"eval_{args.test_start}.json"
+    out_path = MODEL_DIR / "evaluate.json"
     with open(out_path, "w") as f:
         json.dump(report, f, indent=2)
     print(f"  Report saved to -> {out_path}")

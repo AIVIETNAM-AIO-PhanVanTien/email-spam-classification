@@ -166,7 +166,7 @@ def main(snapshot: str, target_precision: float, model_choice: str):
             "scaler": f"data/gold/snapshot={snapshot}/artifacts/numeric_scaler.pkl",
         },
     }
-    meta_path = MODEL_DIR / "model_metadata.json"
+    meta_path = MODEL_DIR / "train.json"
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2, default=str)
 

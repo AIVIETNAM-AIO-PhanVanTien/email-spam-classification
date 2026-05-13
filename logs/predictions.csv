@@ -1,0 +1,4 @@
+timestamp,subject,body,prediction,spam_probability
+2026-05-13T13:52:50.610784+00:00,Free iPhone,Click here now,spam,0.890000
+2026-05-13T13:52:50.628525+00:00,Q3 review,Agenda attached for Friday.,not_spam,0.080000
+2026-05-13T13:52:50.644998+00:00,Q3 review,Agenda attached.,not_spam,0.110000

@@ -1,0 +1,22 @@
+[Unit]
+Description=Email Spam Gmail near-real-time poller
+After=network.target email-spam-api.service
+Wants=email-spam-api.service
+
+[Service]
+User=ec2-user
+WorkingDirectory=/home/ec2-user/email-spam-classification
+Environment="PYTHONPATH=/home/ec2-user/email-spam-classification"
+Environment="API_URL=http://127.0.0.1:8000/predict"
+Environment="GMAIL_TOKEN_JSON=/home/ec2-user/email-spam-classification/app/secrets/gmail_token.json"
+Environment="GMAIL_STATE_PATH=/home/ec2-user/email-spam-classification/logs/gmail_state.json"
+Environment="GMAIL_PREDICTION_LOG=/home/ec2-user/email-spam-classification/logs/gmail_predictions.csv"
+Environment="GMAIL_POLL_INTERVAL_SECONDS=30"
+Environment="GMAIL_LABEL_SPAM=AI_SPAM"
+Environment="GMAIL_LABEL_HAM=AI_HAM"
+ExecStart=/home/ec2-user/email-spam-classification/.venv/bin/python -m app.gmail_poller
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

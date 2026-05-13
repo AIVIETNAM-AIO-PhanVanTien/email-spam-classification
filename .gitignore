@@ -250,5 +250,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+app/secrets/
 
 .DS_Store

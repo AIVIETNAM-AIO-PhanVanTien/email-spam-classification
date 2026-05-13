@@ -1,0 +1,79 @@
+# Serving stack: FastAPI + Streamlit + (optional) Gmail poller.
+# Build context is the repo root so Dockerfile can reach src/, models/, data/gold/.
+#   docker compose -f app/docker-compose.yml up -d --build
+#   docker compose -f app/docker-compose.yml --profile gmail up -d
+
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: app/Dockerfile
+    image: email-spam-classifier:latest
+    container_name: spam-api
+    ports:
+      - "8000:8000"
+    environment:
+      MODEL_PATH: /app/models/best_spam_classifier.pkl
+      MODEL_METADATA_PATH: /app/models/train.json
+      GOLD_DIR: /app/data/gold
+      PREDICTION_LOG_PATH: /app/logs/predictions.csv
+    volumes:
+      # Models + gold artifacts mounted RW: Airflow on the host writes new
+      # champion pkl + new snapshot artifacts, FastAPI reloads from disk
+      # on /admin/reload-model. Bind both so the snapshot lookup in
+      # train.json always points at a real folder.
+      - ../models:/app/models
+      - ../data/gold:/app/data/gold:ro
+      - ../logs:/app/logs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  streamlit:
+    build:
+      context: ..
+      dockerfile: app/Dockerfile
+    image: email-spam-classifier:latest
+    container_name: spam-ui
+    command: ["streamlit", "run", "app/streamlit_app.py",
+              "--server.port", "8501", "--server.address", "0.0.0.0",
+              "--server.headless", "true",
+              "--browser.gatherUsageStats", "false"]
+    ports:
+      - "8501:8501"
+    environment:
+      API_URL: http://api:8000/predict
+      HEALTH_URL: http://api:8000/health
+      GMAIL_PREDICTION_LOG: /app/logs/gmail_predictions.csv
+      PREDICTION_LOG_PATH: /app/logs/predictions.csv
+    volumes:
+      - ../logs:/app/logs:ro
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  gmail-poller:
+    build:
+      context: ..
+      dockerfile: app/Dockerfile
+    image: email-spam-classifier:latest
+    container_name: spam-gmail-poller
+    command: ["python", "-m", "app.gmail_poller"]
+    profiles: ["gmail"]   # opt-in: docker compose --profile gmail up
+    environment:
+      API_URL: http://api:8000/predict
+      GMAIL_TOKEN_JSON: /app/secrets/gmail_token.json
+      GMAIL_STATE_PATH: /app/logs/gmail_state.json
+      GMAIL_PREDICTION_LOG: /app/logs/gmail_predictions.csv
+      GMAIL_POLL_INTERVAL_SECONDS: "30"
+      GMAIL_LABEL_SPAM: AI_SPAM
+      GMAIL_LABEL_HAM: AI_HAM
+    volumes:
+      - ./secrets:/app/secrets:ro
+      - ../logs:/app/logs
+    depends_on:
+      - api
+    restart: unless-stopped

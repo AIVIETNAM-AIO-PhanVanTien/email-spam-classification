@@ -1,0 +1,19 @@
+[Unit]
+Description=Email Spam Streamlit UI
+After=network.target email-spam-api.service
+Wants=email-spam-api.service
+
+[Service]
+User=ec2-user
+WorkingDirectory=/home/ec2-user/email-spam-classification
+Environment="PYTHONPATH=/home/ec2-user/email-spam-classification"
+Environment="API_URL=http://127.0.0.1:8000/predict"
+Environment="HEALTH_URL=http://127.0.0.1:8000/health"
+Environment="GMAIL_PREDICTION_LOG=/home/ec2-user/email-spam-classification/logs/gmail_predictions.csv"
+Environment="PREDICTION_LOG_PATH=/home/ec2-user/email-spam-classification/logs/predictions.csv"
+ExecStart=/home/ec2-user/email-spam-classification/.venv/bin/streamlit run app/streamlit_app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true --browser.gatherUsageStats false
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

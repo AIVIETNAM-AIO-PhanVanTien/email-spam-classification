@@ -336,5 +336,5 @@ chmod +x scripts/run_data_pipeline.sh
 ## 10. Next steps (sau khi data pipeline xong)
 
 1. **`monthly_feature.py`** — transform-only mỗi tháng mới (xem [Gold_Build_Review §4](Gold_Build_Review.md))
-2. **`initial_load.py`** — train champion v1 trên gold/full_load → register lên MLflow
-3. **Airflow DAG `initial_full_load`** — wrap §6 script này vào DAG (BashOperator), chạy local trước rồi mới EC2
+2. **Champion v1 bootstrap** — đã có sẵn `src/pipelines/train.py` train 4 candidates trên `data/gold/snapshot=YYYY-MM/full_load/` rồi pick winner → `models/best_spam_classifier.pkl` + `models/train.json`. **Không cần thêm `initial_load.py` riêng** (MLflow đã bỏ khỏi scope — xem [PROJECT_CONTEXT.md §5.5](PROJECT_CONTEXT.md))
+3. **Airflow DAG `initial_full_load`** — wrap §6 + `train.py` vào DAG (BashOperator), chạy local trước rồi mới EC2

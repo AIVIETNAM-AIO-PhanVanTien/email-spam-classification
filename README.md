@@ -1,9 +1,9 @@
 # End-to-End Email Spam Classification (MLOps demo)
 
 Binary email-spam classifier (`0 = ham`, `1 = spam`) built as an MVP MLOps
-system: synthetic monthly partitions → Medallion data lake → MLflow-tracked
-training → Model Registry promotion → FastAPI/Streamlit serving with hot
-reload, all orchestrated by Airflow.
+system: synthetic monthly partitions → Medallion data lake → scikit-learn
+training → pkl-based champion/challenger swap → FastAPI/Streamlit serving
+with hot reload, all orchestrated by Airflow.
 
 > **Project status (11/May/2026)**
 >
@@ -14,15 +14,22 @@ reload, all orchestrated by Airflow.
 >
 > Project chỉ chạy **2 sprint** (không chia thêm sprint nhỏ). Đầu mối tài liệu: [docs/INDEX.md](docs/INDEX.md).
 >
-> **Code hiện có** ([src/](src/)): `etl/{bronze_ingest, silver_transform, gold_build}.py` + `utils/{split_raw, text_preprocessing, data_quality_check}.py` + `pipelines/{train, evaluate}.py`. **Chưa có**: `predict.py`, `app/`, `dags/`, `tests/`, MLflow, Airflow, FastAPI, Streamlit — sẽ làm ở Sprint 2.
+> **Code hiện có** ([src/](src/)): `etl/{bronze_ingest, silver_transform, gold_build}.py` + `utils/{split_raw, text_preprocessing, data_quality_check}.py` + `pipelines/{train, evaluate}.py`. **Chưa có**: `predict.py`, `app/`, `dags/`, `tests/`, Airflow, FastAPI, Streamlit — sẽ làm ở Sprint 2.
+>
+> **MLflow dropped (Sprint 2 scope decision)**: Tracking & registry chuyển sang
+> file-based — `models/best_spam_classifier.pkl` (current champion) +
+> `models/versions/v{N}.pkl` (history) + `models/train.json` (metrics). Promotion =
+> atomic pkl swap với backup-rollback. Lý do: scope hẹp 2-sprint, ưu tiên demo
+> chạy được Airflow + FastAPI + Streamlit + Gmail poller end-to-end.
 
 > **Two parallel tracks** in this repo:
 >
-> 1. **Production pipeline** (this README): Medallion + Airflow + MLflow + drift +
->    champion/challenger. Trained via `src/pipelines/initial_load.py`.
+> 1. **Production pipeline** (this README): Medallion + Airflow + drift +
+>    champion/challenger. Bootstrap via `src/pipelines/train.py`; monthly loop
+>    via `src/pipelines/monthly_run.py`.
 > 2. **Baseline POC**: model trained from
 >    [notebooks/baseline/Email_Classification_V2.ipynb](notebooks/baseline/Email_Classification_V2.ipynb),
->    deployed to a single EC2 with FastAPI + Streamlit (no Airflow / MLflow).
+>    deployed to a single EC2 with FastAPI + Streamlit (no Airflow).
 >    See [docs/DEPLOY_BASELINE_EC2.md](docs/DEPLOY_BASELINE_EC2.md) and
 >    [docs/SETUP_GMAIL_API.md](docs/SETUP_GMAIL_API.md) (Gmail integration).
 >    Serving uses [src/notebook_preprocessing.py](src/notebook_preprocessing.py)
@@ -74,21 +81,23 @@ data/gold/snapshot=YYYY-MM/
         │
         ▼
 ┌──────────── Airflow ────────────┐
-│ initial_full_load   (one-shot)  │
+│ initial_full_load   (one-shot)  │  →  src.pipelines.train  →  models/best_spam_classifier.pkl
 │ monthly_email_ml_pipeline (@m)  │
 │   • monthly_run.py              │
 │   • drift check vs ref window   │
 │   • retrain if drift_score ≥ τ  │
-│   • MLflow log + register +     │
-│     promote Production          │
+│   • champion vs challenger      │
+│   • promote = atomic pkl swap   │
+│     (+ models/versions/v{N}.pkl)│
 │   • POST /admin/reload-model    │
 └──────────────┬──────────────────┘
                ▼
-   ┌──── MLflow Registry ────┐
-   │  email-spam-classifier  │
-   │  v1, v2, …              │
-   │  alias / stage = prod   │
-   └──────────┬──────────────┘
+   ┌──── models/ ───────────────────────────┐
+   │  best_spam_classifier.pkl  ← current   │
+   │  model_metadata.json       ← threshold │
+   │  versions/v1.pkl, v2.pkl, …            │
+   │  decisions/<month>.json                │
+   └──────────┬─────────────────────────────┘
               ▼
    ┌────── FastAPI ────────┐         ┌──── Streamlit ────┐
    │ GET  /health          │ ◀────── │ subject + body    │
@@ -99,8 +108,9 @@ data/gold/snapshot=YYYY-MM/
        logs/predictions.csv
 ```
 
-GitHub Actions does **CI/CD only** (test + deploy code/DAGs). Airflow owns
-all training orchestration.
+`/admin/reload-model` hot-reloads the pkl from disk → FastAPI picks up the
+new champion mà không cần restart. GitHub Actions does **CI/CD only**
+(test + deploy code/DAGs). Airflow owns all training orchestration.
 
 ## 2. Tech Stack
 
@@ -109,7 +119,7 @@ all training orchestration.
 | Language | Python 3.11 |
 | Data | pandas, pyarrow, parquet, Hive partitioning |
 | ML | scikit-learn (`Pipeline(TfidfVectorizer + LogisticRegression)`) |
-| Tracking & registry | MLflow |
+| Model versioning | File-based — pkl + JSON metadata (no MLflow; champion atomic swap, history under `models/versions/`) |
 | Orchestration | Airflow |
 | Serving | FastAPI + Uvicorn |
 | UI | Streamlit |
@@ -164,18 +174,18 @@ email-spam-classification/
 ```
 src/
 ├── pipelines/
-│   ├── initial_load.py                     # bootstrap champion v1 → MLflow
-│   └── monthly_run.py                      # ingest + drift + C/C per month
-├── monitoring/
-│   └── drift_detector.py                   # chi-square label + KS/PSI feature
-└── serving/
-    ├── gmail_client.py
-    └── gmail_poller.py
+│   └── monthly_run.py                      # ingest + drift + C/C per month;
+│                                           # champion swap = backup pkl + overwrite
+│                                           # (bootstrap champion v1 dùng src.pipelines.train,
+│                                           # không cần file initial_load.py riêng)
+└── monitoring/
+    └── drift_detector.py                   # chi-square label + KS/PSI feature
 
-app/{api.py, streamlit_app.py, Dockerfile, docker-compose.yml}
+app/{api.py, streamlit_app.py, gmail_client.py, gmail_poller.py, Dockerfile, docker-compose.yml}
 airflow/{Dockerfile, docker-compose.yml, .env.example}
 dags/{initial_full_load_dag.py, monthly_email_ml_pipeline.py}
 scripts/{run_monthly_training.sh, gmail_oauth_bootstrap.py, systemd/}
+models/versions/v{N}.pkl                     # version history (atomic-swap rollback target)
 reports/monthly_runs/<month>/{drift_report,decision,champion_challenger}.json
 tests/                                       # preprocessing, ETL, predict, API, drift
 .github/workflows/{ci.yml, deploy.yml}
@@ -211,7 +221,7 @@ python -m src.pipelines.train --snapshot 2026-04
 python -m src.pipelines.evaluate --test-start 2026-04
 ```
 
-Các bước Sprint 2 (serve, Airflow, MLflow, Gmail) đang trong backlog — xem `docs/Sprint_2_Tickets.md`.
+Các bước Sprint 2 (serve, Airflow, Gmail) đang trong backlog — xem `docs/Sprint_2_Tickets.md`.
 
 ## 5. Monthly loop (Airflow on EC2)
 
@@ -224,9 +234,11 @@ In the Airflow UI, trigger `monthly_email_ml_pipeline` with config:
 The DAG runs `src.pipelines.monthly_run` end-to-end:
 ingest → drift check → (if `drift_score ≥ DRIFT_SCORE_THRESHOLD`) train challenger
 → champion/challenger comparison on the new month's gold test set → promote
-challenger only if `challenger.f1 ≥ champion.f1 + PROMOTION_F1_DELTA` (default 0.0)
-→ `POST /admin/reload-model`. On rejection, the local `models/best_spam_classifier.pkl`
-is restored from a pre-train backup so `/predict` fallback keeps using the champion.
+challenger only if `challenger.f1 ≥ champion.f1 + PROMOTION_F1_DELTA` (default 0.0).
+Promotion = backup current `models/best_spam_classifier.pkl` to
+`models/versions/v{N}.pkl`, atomic-overwrite champion pkl, then
+`POST /admin/reload-model` (FastAPI reloads from disk). On rejection, không
+ghi đè gì cả — champion pkl giữ nguyên.
 
 Per-month artefacts persisted under `reports/monthly_runs/<month>/`:
 `drift_report.json`, `decision.json`, `champion_challenger.json`.
@@ -241,7 +253,7 @@ Repeat with `2025-12`, `2026-01`, … to replay a year of production in minutes.
 | Training input | `processed_text` from silver layer (single source of truth via `src/text_preprocessing.py`) |
 | Threshold selection | smallest `t` s.t. `precision(t) ≥ TARGET_PRECISION` (default 0.99 — minimize false positives, FSD §11.2) |
 | Primary metric | F1 + Average Precision (AUC-PR); accuracy is **not** a selection metric |
-| Registry | `email-spam-classifier`, alias/stage `Production` |
+| Versioning | `models/best_spam_classifier.pkl` (current champion) + `models/versions/v{N}.pkl` (history) + `models/train.json` (metrics). Promotion = atomic file swap. |
 
 ## 7. API contract
 
@@ -251,7 +263,7 @@ POST /predict
 → { "label": "spam", "spam_probability": 0.94, "threshold": 0.99 }
 
 GET  /health
-POST /admin/reload-model      # called at the end of every monthly DAG run
+POST /admin/reload-model      # reload best_spam_classifier.pkl from disk; called at end of every monthly DAG run
 ```
 
 Predictions append to `logs/predictions.csv`:
@@ -268,7 +280,7 @@ Covers `src/text_preprocessing.py`, the full ETL pipeline (toy dataset),
 ## 9. Docker
 
 The serving stack and the Airflow stack are **two independent compose files**.
-Production EC2 still uses systemd for Airflow + MLflow; Docker is for local dev.
+Production EC2 uses systemd for FastAPI + Streamlit + Airflow; Docker is for local dev.
 
 ### Serving stack (FastAPI + Streamlit + Gmail poller)
 
@@ -311,20 +323,20 @@ directly without an external venv.
 | Tech Lead / Solution Architect | Architecture, PR review, Airflow/Docker integration, deploy, demo |
 | QA / QC Engineer | Acceptance criteria, test cases, issue log, final QA report |
 | AI Data Engineer | Dataset, EDA, Medallion pipeline, Dataset Quality & Hygiene |
-| AI Pipeline / MLOps Engineer | Training workflow, MLflow registry, Airflow DAGs, monthly report |
+| AI Pipeline / MLOps Engineer | Training workflow, pkl-based model versioning, Airflow DAGs, monthly report |
 | AI Model Serving Engineer | `predict.py`, FastAPI, Streamlit, prediction logging, model version |
 
 ## 11. Definition of Done
 
 - Medallion pipeline produces bronze, silver, gold for at least one month window
-- `initial_full_load` DAG trains champion v1 and promotes it to MLflow Production
+- `initial_full_load` DAG trains champion v1 → `models/best_spam_classifier.pkl`
 - `monthly_email_ml_pipeline` DAG runs end-to-end for at least one new month
-- FastAPI `/predict` returns the contract response and `/admin/reload-model` works
+- FastAPI `/predict` returns the contract response and `/admin/reload-model` works (reloads pkl from disk)
 - Streamlit UI predicts via the API and shows label + probability
 - `logs/predictions.csv` is populated
 - `pytest` is green (43 tests)
 - `docker compose -f app/docker-compose.yml up` runs api + streamlit
-- `docker compose -f airflow/docker-compose.yml up` runs Airflow 3.x + MLflow
+- `docker compose -f airflow/docker-compose.yml up` runs Airflow 3.x
 - README reflects current state
 
 ## 12. Gmail near-real-time filter (online flow)
@@ -335,15 +347,15 @@ Two flows live side-by-side:
 Offline                          Online
 ───────                          ───────
 Airflow monthly DAG              Gmail poller (30s loop)
-  → train + promote              → /predict (FastAPI)
-  → MLflow Production            → apply Gmail label AI_SPAM / AI_HAM
+  → train + champion swap        → /predict (FastAPI)
+  → best_spam_classifier.pkl     → apply Gmail label AI_SPAM / AI_HAM
        │                         → logs/gmail_predictions.csv
        └─────────► FastAPI ◄──────────┘
 ```
 
 The poller is a separate container ([app/gmail_poller.py](app/gmail_poller.py))
 that uses the same FastAPI `/predict` as the UI — so it always picks up the
-latest Production model after `/admin/reload-model` is called.
+latest champion after `/admin/reload-model` is called.
 
 ### One-time OAuth bootstrap
 

@@ -3,7 +3,7 @@
 > **Mục đích**: deploy nhanh baseline model train từ
 > [notebooks/baseline/Email_Classification_V2.ipynb](../notebooks/baseline/Email_Classification_V2.ipynb)
 > lên 1 EC2 instance để test khả thi (FastAPI + Streamlit). KHÔNG phải bản
-> production full Medallion + Airflow + MLflow — đó là track riêng do team
+> production full Medallion + Airflow — đó là track riêng do team
 > khác phụ trách.
 >
 > **Liên quan tới Sprint 2 tickets**:
@@ -113,7 +113,7 @@ rsync -avz -e "ssh -i $KEY" \
 ```
 
 > Dùng `requirements-serving.txt` (lean: chỉ sklearn / fastapi / streamlit / nltk) thay
-> vì `requirements.txt` (có thêm mlflow / dev tooling không cần ở serving).
+> vì `requirements.txt` (có thêm dev tooling / Airflow deps không cần ở serving).
 
 ---
 

@@ -4,135 +4,66 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import joblib
-import numpy as np
-import pandas as pd
-import pyarrow.parquet as pq
-from scipy.sparse import csr_matrix, hstack
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
 from sklearn.naive_bayes import MultinomialNB
-from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 
-from src.pipelines.evaluate import evaluate, pick_threshold
+from src.pipelines.evaluate import evaluate, load_split, pick_threshold
 
-SILVER_DIR = Path("data/silver")
+GOLD_DIR = Path("data/gold")
 MODEL_DIR = Path("models")
 
-NUMERIC_FEATURES = [
-    "log_chars",
-    "avg_word_length",
-    "unique_word_ratio",
-    "exclaim_count",
-]
 
-TFIDF_CONFIG = {
-    "max_features": 30_000,
-    "ngram_range": (1, 2),
-    "min_df": 5,
-    "max_df": 0.95,
-    "sublinear_tf": True,
-}
-
-
-def load_data_by_time(train_end_month: str, test_start_month: str):
-    """
-    Load data from Silver layer and split based on time logic:
-    - Train/Val: <= train_end_month (March backwards)
-    - Test: >= test_start_month (April forward)
-    """
-    print(f"Loading data from {SILVER_DIR}...")
-    frames_trainval = []
-    frames_test = []
-
-    for p in SILVER_DIR.glob("month_partition=*"):
-        month = p.name.split("=")[1]
-        parquet_path = p / "data_silver.parquet"
-        if parquet_path.exists():
-            df = pq.read_table(parquet_path).to_pandas()
-            df["month_partition"] = month
-            if month <= train_end_month:
-                frames_trainval.append(df)
-            elif month >= test_start_month:
-                frames_test.append(df)
-
-    if not frames_trainval:
-        raise ValueError("No data found for Train/Val split.")
-    if not frames_test:
-        raise ValueError("No data found for Test split.")
-
-    df_trainval = pd.concat(frames_trainval, ignore_index=True)
-    df_test = pd.concat(frames_test, ignore_index=True)
-
-    # Split trainval into train and val (85/15)
-    df_train, df_val = train_test_split(
-        df_trainval, test_size=0.15, stratify=df_trainval["label"], random_state=42
-    )
-
-    print(f"Train: {len(df_train):,} rows")
-    print(f"Val:   {len(df_val):,} rows")
-    print(f"Test:  {len(df_test):,} rows")
-
-    return df_train, df_val, df_test
-
-
-def build_features(df_train, df_val, df_test):
-    """Fit TF-IDF and Scaler on train, transform val and test."""
-    print("\nFitting TF-IDF on train set...")
-    vectorizer = TfidfVectorizer(**TFIDF_CONFIG)
-    X_train_text = vectorizer.fit_transform(df_train["body_clean"])
-    X_val_text = vectorizer.transform(df_val["body_clean"])
-    X_test_text = vectorizer.transform(df_test["body_clean"])
-
-    print("Fitting StandardScaler on numeric features...")
-    scaler = StandardScaler()
-    X_train_num = scaler.fit_transform(df_train[NUMERIC_FEATURES])
-    X_val_num = scaler.transform(df_val[NUMERIC_FEATURES])
-    X_test_num = scaler.transform(df_test[NUMERIC_FEATURES])
-
-    X_train = hstack([X_train_text, csr_matrix(X_train_num)])
-    X_val = hstack([X_val_text, csr_matrix(X_val_num)])
-    X_test = hstack([X_test_text, csr_matrix(X_test_num)])
-
-    return vectorizer, scaler, X_train, X_val, X_test
-
-
-def build_candidates():
-    """Return dictionary of ML candidates."""
-    return {
-        "lr": LogisticRegression(max_iter=1000, solver="lbfgs", random_state=42),
+def build_candidates(model_choice: str) -> dict:
+    catalog = {
+        "lr": LogisticRegression(
+            max_iter=1000, solver="lbfgs", random_state=42,
+        ),
         "nb": MultinomialNB(),
-        "rf": RandomForestClassifier(n_estimators=100, n_jobs=-1, random_state=42),
-        "xgb": XGBClassifier(eval_metric="logloss", random_state=42, n_jobs=-1),
+        "rf": RandomForestClassifier(
+            n_estimators=100, n_jobs=-1, random_state=42,
+        ),
+        "xgb": XGBClassifier(
+            eval_metric="logloss", random_state=42, n_jobs=-1,
+        ),
     }
+    if model_choice == "auto":
+        return catalog
+    return {model_choice: catalog[model_choice]}
+
+
+def get_tfidf_vocab_size(snapshot: str) -> int:
+    meta_path = GOLD_DIR / f"snapshot={snapshot}" / "artifacts" / "tfidf_metadata.json"
+    return int(json.loads(meta_path.read_text())["vocab_size"])
 
 
 def maybe_slice_features(name: str, X, n_tfidf: int):
-    """NB requires non-negative inputs. Slice only TF-IDF for NB."""
+    # MultinomialNB requires non-negative input; the scaled numeric block can be negative.
     if name == "nb":
         return X[:, :n_tfidf]
     return X
 
 
 def train_one(
-    name, model, X_train, y_train, X_val, y_val, X_test, y_test, target_precision, n_tfidf
-):
+    name: str, model, X_train, y_train, X_val, y_val, X_test, y_test,
+    target_precision: float, n_tfidf: int,
+) -> dict:
     print(f"\n── [{name.upper()}] fitting ─────────────────────────────")
     Xt_train = maybe_slice_features(name, X_train, n_tfidf)
     Xt_val = maybe_slice_features(name, X_val, n_tfidf)
     Xt_test = maybe_slice_features(name, X_test, n_tfidf)
-
     if name == "nb":
-        print(f"  [NB] using TF-IDF only: {Xt_train.shape} (ignoring numeric due to negative values)")
+        print(f"  [NB] tfidf-only: {Xt_train.shape} (dropping numeric block: contains negatives)")
 
     model.fit(Xt_train, y_train)
     val_prob = model.predict_proba(Xt_val)[:, 1]
     test_prob = model.predict_proba(Xt_test)[:, 1]
 
-    threshold, p_at_t, r_at_t, hit = pick_threshold(y_val, val_prob, target_precision)
-    status = "HIT" if hit else f"MISS (max P = {p_at_t:.4f})"
+    threshold, p_at_t, r_at_t, hit = pick_threshold(
+        y_val, val_prob, target_precision
+    )
+    status = "HIT" if hit else f"MISS (max P observed = {p_at_t:.4f})"
     print(f"  threshold={threshold:.4f}  val P={p_at_t:.4f}  R={r_at_t:.4f}  | {status}")
 
     val_metrics = evaluate(y_val, val_prob, threshold)
@@ -154,91 +85,111 @@ def train_one(
     }
 
 
-def pick_winner(results, target_precision):
-    """Pick model with highest precision. Tiebreak by recall. Fallback to AP."""
+def pick_winner(results: dict, target_precision: float):
+    # All hit models already satisfy P >= target at their chosen threshold,
+    # so recall is the meaningful tiebreaker. Fall back to AP when none hit.
     hit_models = {n: r for n, r in results.items() if r["hit_target"]}
     if hit_models:
         winner = max(
-            hit_models,
-            key=lambda n: (
-                hit_models[n]["val_metrics"]["precision"],
-                hit_models[n]["val_metrics"]["recall"],
-            ),
+            hit_models, key=lambda n: hit_models[n]["val_metrics"]["recall"]
         )
         reason = (
-            f"highest precision ({hit_models[winner]['val_metrics']['precision']:.4f}) "
-            f"with recall ({hit_models[winner]['val_metrics']['recall']:.4f})"
+            f"precision >= {target_precision} with highest recall@threshold "
+            f"({hit_models[winner]['val_metrics']['recall']:.4f})"
         )
     else:
-        winner = max(results, key=lambda n: results[n]["val_metrics"]["average_precision"])
-        reason = f"no model hit target P. Fallback to highest AP(val) ({results[winner]['val_metrics']['average_precision']:.4f})"
+        winner = max(
+            results, key=lambda n: results[n]["val_metrics"]["average_precision"]
+        )
+        reason = (
+            f"no model hit P>={target_precision}; fallback to highest "
+            f"AP(val) ({results[winner]['val_metrics']['average_precision']:.4f})"
+        )
     return winner, reason
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Train Baseline Models")
-    parser.add_argument("--train-end", default="2026-03", help="Max month for train/val (e.g., 2026-03)")
-    parser.add_argument("--test-start", default="2026-04", help="Min month for test (e.g., 2026-04)")
-    parser.add_argument("--target-precision", type=float, default=0.99, help="Target Precision")
-    args = parser.parse_args()
+def main(snapshot: str, target_precision: float, model_choice: str):
+    print(f"[1/4] Loading snapshot={snapshot}")
+    X_train, y_train = load_split(snapshot, "train")
+    X_val, y_val = load_split(snapshot, "val")
+    X_test, y_test = load_split(snapshot, "test")
+    n_tfidf = get_tfidf_vocab_size(snapshot)
+    print(f"  train={X_train.shape}  val={X_val.shape}  test={X_test.shape}  "
+          f"(tfidf_vocab={n_tfidf})")
+    print(f"  spam_ratio  train={y_train.mean():.4f}  val={y_val.mean():.4f}  "
+          f"test={y_test.mean():.4f}")
 
-    print("[1/5] Loading & Splitting Data")
-    df_train, df_val, df_test = load_data_by_time(args.train_end, args.test_start)
-
-    y_train = df_train["label"].values
-    y_val = df_val["label"].values
-    y_test = df_test["label"].values
-
-    print("[2/5] Building Features")
-    vectorizer, scaler, X_train, X_val, X_test = build_features(df_train, df_val, df_test)
-    n_tfidf = len(vectorizer.vocabulary_)
-
-    print("[3/5] Training Candidates")
-    candidates = build_candidates()
-    results = {}
-    for name, model in candidates.items():
-        results[name] = train_one(
+    print(f"[2/4] Training candidates: {model_choice}")
+    candidates = build_candidates(model_choice)
+    results = {
+        name: train_one(
             name, model, X_train, y_train, X_val, y_val, X_test, y_test,
-            args.target_precision, n_tfidf
+            target_precision, n_tfidf,
         )
+        for name, model in candidates.items()
+    }
 
-    print("\n[4/5] Picking Winner")
-    winner_name, reason = pick_winner(results, args.target_precision)
+    print("\n[3/4] Picking winner")
+    winner_name, reason = pick_winner(results, target_precision)
     winner = results[winner_name]
     print(f"  WINNER = {winner_name.upper()} — {reason}")
 
-    print("[5/5] Saving Artifacts")
+    print("[4/4] Saving model + metadata")
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    
-    # Save the winner model, vectorizer, and scaler
-    joblib.dump(winner["model"], MODEL_DIR / "best_model.pkl")
-    joblib.dump(vectorizer, MODEL_DIR / "vectorizer.pkl")
-    joblib.dump(scaler, MODEL_DIR / "scaler.pkl")
+    model_path = MODEL_DIR / "best_spam_classifier.pkl"
+    joblib.dump(winner["model"], model_path)
 
     def serializable(r):
         return {k: v for k, v in r.items() if k != "model"}
 
     meta = {
+        "snapshot": snapshot,
         "trained_at": datetime.now(UTC).isoformat(),
-        "train_end": args.train_end,
-        "test_start": args.test_start,
-        "target_precision": args.target_precision,
+        "target_precision": target_precision,
+        "model_choice_flag": model_choice,
         "winner": winner_name,
         "winner_reason": reason,
+        "model_type": type(winner["model"]).__name__,
         "threshold": winner["threshold"],
+        "threshold_hit_target": winner["hit_target"],
+        "feature_subset": winner["feature_subset"],
         "val_metrics": winner["val_metrics"],
         "test_metrics": winner["test_metrics"],
         "candidates": {n: serializable(r) for n, r in results.items()},
+        "n_features": int(X_train.shape[1]),
         "n_tfidf_features": n_tfidf,
         "n_train": int(X_train.shape[0]),
         "n_val": int(X_val.shape[0]),
         "n_test": int(X_test.shape[0]),
+        "gold_artifacts": {
+            "vectorizer": f"data/gold/snapshot={snapshot}/artifacts/tfidf_vectorizer.pkl",
+            "scaler": f"data/gold/snapshot={snapshot}/artifacts/numeric_scaler.pkl",
+        },
     }
-    with open(MODEL_DIR / "metadata.json", "w") as f:
+    meta_path = MODEL_DIR / "train.json"
+    with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2, default=str)
 
-    print("  Models and metadata successfully saved in `models/` directory.")
+    print(f"  model    → {model_path}")
+    print(f"  metadata → {meta_path}")
+    return meta
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="Train LR + NB + RF + XGB on a Gold snapshot, save the winner"
+    )
+    parser.add_argument(
+        "--snapshot", required=True,
+        help="Holdout month snapshot name (YYYY-MM, e.g. 2026-04)"
+    )
+    parser.add_argument(
+        "--target-precision", type=float, default=0.99,
+        help="Minimum precision for threshold selection (default 0.99, FSD §11.2)"
+    )
+    parser.add_argument(
+        "--model", choices=["auto", "lr", "nb", "rf", "xgb"], default="auto",
+        help="auto = train all 4 and pick winner; otherwise train a single model"
+    )
+    args = parser.parse_args()
+    main(args.snapshot, args.target_precision, args.model)

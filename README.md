@@ -14,7 +14,7 @@ reload, all orchestrated by Airflow.
 >
 > Project chỉ chạy **2 sprint** (không chia thêm sprint nhỏ). Đầu mối tài liệu: [docs/INDEX.md](docs/INDEX.md).
 >
-> **Code hiện có** ([src/](src/)): `etl/{bronze_ingest, silver_transform, gold_build}.py` + `utils/{split_raw, text_preprocessing, data_quality_check}.py`. **Chưa có**: `train.py`, `predict.py`, `app/`, `dags/`, `tests/`, MLflow, Airflow, FastAPI, Streamlit — sẽ làm ở Sprint 2.
+> **Code hiện có** ([src/](src/)): `etl/{bronze_ingest, silver_transform, gold_build}.py` + `utils/{split_raw, text_preprocessing, data_quality_check}.py` + `pipelines/{train, evaluate}.py`. **Chưa có**: `predict.py`, `app/`, `dags/`, `tests/`, MLflow, Airflow, FastAPI, Streamlit — sẽ làm ở Sprint 2.
 
 > **Two parallel tracks** in this repo:
 >
@@ -133,7 +133,7 @@ email-spam-classification/
 │       ├── full_load/{train,val,test}.parquet + *_X.npz + _build_log.json
 │       └── artifacts/{tfidf_vectorizer,numeric_scaler}.pkl + tfidf_metadata.json
 ├── docs/                                   # FSD, sprint plan, advisor PDFs
-├── models/                                 # rỗng — train.py sẽ ghi pkl + metadata.json
+├── models/                                 # train.py ghi best_spam_classifier.pkl + train.json; evaluate.py ghi evaluate.json
 ├── notebooks/
 │   ├── 01_eda_bronze.ipynb
 │   ├── 02_eda_silver.ipynb
@@ -147,8 +147,8 @@ email-spam-classification/
 │   │   ├── silver_transform.py             # clean + features + quality_report.json
 │   │   └── gold_build.py                   # split train/val/test + TF-IDF + scaler
 │   ├── pipelines/                          # orchestrator scripts (CLI entry points)
-│   │   ├── train.py                        # baseline LR → models/best_spam_classifier.pkl
-│   │   └── evaluate.py                     # eval model trên 1 split + lib functions
+│   │   ├── train.py                        # train 4 candidates (LR/NB/RF/XGB) on Gold snapshot → models/best_spam_classifier.pkl + train.json
+│   │   └── evaluate.py                     # eval saved model on Silver months >= --test-start → models/evaluate.json
 │   └── utils/                              # pure libraries (import-only, no CLI)
 │       ├── text_preprocessing.py           # TextCleaner — silver dùng
 │       └── data_quality_check.py           # TextDataQuality — silver dùng
@@ -203,11 +203,12 @@ done
 # 3) Build gold snapshot tới tháng holdout (tự discover silver ≤ tháng này)
 python -m src.etl.gold_build --month 2026-04
 
-# 4) Train baseline LR → models/best_spam_classifier.pkl + metadata.json
+# 4) Train 4 candidates (LR/NB/RF/XGB), chọn winner → models/best_spam_classifier.pkl + train.json
 python -m src.pipelines.train --snapshot 2026-04
+# (--model lr|nb|rf|xgb để train một model duy nhất; default 'auto' = train hết rồi pick winner)
 
-# 5) (Tuỳ chọn) Eval lại model trên split khác / snapshot khác
-python -m src.pipelines.evaluate --snapshot 2026-04 --split test
+# 5) (Tuỳ chọn) Eval lại winner trên các tháng Silver >= test-start → models/evaluate.json
+python -m src.pipelines.evaluate --test-start 2026-04
 ```
 
 Các bước Sprint 2 (serve, Airflow, MLflow, Gmail) đang trong backlog — xem `docs/Sprint_2_Tickets.md`.

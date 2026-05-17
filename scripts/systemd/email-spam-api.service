@@ -1,0 +1,18 @@
+[Unit]
+Description=Email Spam FastAPI service
+After=network.target
+
+[Service]
+User=ec2-user
+WorkingDirectory=/home/ec2-user/email-spam-classification
+Environment="PYTHONPATH=/home/ec2-user/email-spam-classification"
+Environment="MODEL_PATH=/home/ec2-user/email-spam-classification/models/best_spam_classifier.pkl"
+Environment="MODEL_METADATA_PATH=/home/ec2-user/email-spam-classification/models/train.json"
+Environment="GOLD_DIR=/home/ec2-user/email-spam-classification/data/gold"
+Environment="PREDICTION_LOG_PATH=/home/ec2-user/email-spam-classification/logs/predictions.csv"
+ExecStart=/home/ec2-user/email-spam-classification/.venv/bin/uvicorn app.api:app --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -19,7 +19,10 @@ import pandas as pd
 
 class TextCleaner:
     def __init__(self, series: pd.Series):
-        self.s = series.astype(str)
+        # Force object dtype: with pandas 2.x + pyarrow, parquet str columns become
+        # ArrowStringArray, which uses RE2 — no \1 backref support (fix_repeated_chars
+        # uses one). object dtype routes through python's `re`, which handles backrefs.
+        self.s = series.astype(str).astype(object)
 
     # ── 1. Normalize unicode ──────────────────────────────────────────────────
     # Chuẩn hóa full-width chars và loại bỏ ký tự non-ASCII
@@ -47,8 +50,11 @@ class TextCleaner:
     # Spam hay dùng kỹ thuật lặp ký tự để bypass filter
     # viiiiagra → viigra, FREEEEE → freee (sau lowercase)
     # Giữ lại 2 ký tự thay vì 1 để không mất nghĩa từ (ví dụ: "good" vs "goood")
+    # Apply via python re: backreferences aren't supported by pyarrow's RE2 engine,
+    # which pandas 2.x defaults to for ArrowStringArray.
+    _REPEATED_RE = re.compile(r"(.)\1{2,}")
     def fix_repeated_chars(self):
-        self.s = self.s.str.replace(r"(.)\1{2,}", r"\1\1", regex=True)
+        self.s = self.s.map(lambda x: self._REPEATED_RE.sub(r"\1\1", x) if isinstance(x, str) else x)
         return self
 
     # ── 5. Normalize escapenumber obfuscation ───────────────────────────────────

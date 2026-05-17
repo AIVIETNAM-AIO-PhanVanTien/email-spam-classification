@@ -250,5 +250,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+app/secrets/
 
 .DS_Store
+
+# Conquer kit (local-only LaTeX scaffold)
+AIConquer2026_Kit/

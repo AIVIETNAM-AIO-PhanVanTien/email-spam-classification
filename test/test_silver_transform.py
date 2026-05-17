@@ -6,6 +6,7 @@ import pyarrow.parquet as pq
 from src.etl import silver_transform
 
 
+# Tiêu chí: Bước Silver làm sạch nội dung email và sinh đầy đủ đặc trưng văn bản quan trọng.
 def test_run_text_cleaning_and_features(bronze_like_df):
     df = silver_transform.run_text_cleaning(bronze_like_df.copy())
     df = silver_transform.run_text_features(df)
@@ -17,6 +18,7 @@ def test_run_text_cleaning_and_features(bronze_like_df):
     assert df.loc[0, "exclaim_count"] == 3
 
 
+# Tiêu chí: Kiểm tra chất lượng Silver cắt nội dung quá dài và loại bỏ bản ghi không đạt chuẩn.
 def test_run_quality_check_truncates_and_drops_rows(monkeypatch):
     df = pd.DataFrame(
         {
@@ -36,6 +38,7 @@ def test_run_quality_check_truncates_and_drops_rows(monkeypatch):
     assert report["dropped_null_label"] == 1
 
 
+# Tiêu chí: Silver ghi đúng partition parquet, quality report và quality log phục vụ truy vết.
 def test_write_silver_partition_and_quality_report(tmp_path, monkeypatch, bronze_like_df):
     silver_dir = tmp_path / "silver"
     monkeypatch.setattr(silver_transform, "SILVER_DIR", silver_dir)

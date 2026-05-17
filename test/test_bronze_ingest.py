@@ -2,10 +2,12 @@ from pathlib import Path
 
 import pandas as pd
 import pyarrow.parquet as pq
+import pytest
 
 from src.etl import bronze_ingest
 
 
+# Tiêu chí: Thời gian nhận email được sinh ổn định và luôn nằm đúng tháng dữ liệu.
 def test_inject_received_at_is_deterministic_and_in_month():
     df = pd.DataFrame({"body": ["a", "b"], "raw_label": ["ham", "spam"]})
 
@@ -17,6 +19,7 @@ def test_inject_received_at_is_deterministic_and_in_month():
     assert first["month_partition"].eq("2025-02").all()
 
 
+# Tiêu chí: Bước Bronze tạo đúng partition, mã email, nhãn chuẩn hóa và log ingest.
 def test_ingest_writes_bronze_partition_and_log(tmp_path, monkeypatch):
     raw_dir = tmp_path / "raw" / "by_month"
     bronze_dir = tmp_path / "bronze"
@@ -40,6 +43,7 @@ def test_ingest_writes_bronze_partition_and_log(tmp_path, monkeypatch):
     assert (bronze_dir / "_ingestion_log.csv").exists()
 
 
+# Tiêu chí: Bước ingest không ghi đè dữ liệu Bronze khi partition đã tồn tại.
 def test_ingest_is_idempotent_when_partition_exists(tmp_path, monkeypatch):
     bronze_dir = tmp_path / "bronze"
     out_dir = bronze_dir / "month_partition=2025-02"
@@ -51,3 +55,12 @@ def test_ingest_is_idempotent_when_partition_exists(tmp_path, monkeypatch):
     bronze_ingest.ingest("2025-02")
 
     assert (out_dir / "data.parquet").read_bytes() == b"already here"
+
+
+# Tiêu chí: Bronze báo lỗi rõ ràng khi file raw theo tháng chưa được chuẩn bị.
+def test_ingest_raises_when_raw_file_is_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(bronze_ingest, "BRONZE_DIR", tmp_path / "bronze")
+    monkeypatch.setattr(bronze_ingest, "RAW_DIR", tmp_path / "raw")
+
+    with pytest.raises(FileNotFoundError, match="Raw file"):
+        bronze_ingest.ingest("2025-03")

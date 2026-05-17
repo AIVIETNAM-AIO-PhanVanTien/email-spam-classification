@@ -39,6 +39,7 @@ def _gold_ready_df() -> pd.DataFrame:
     )
 
 
+# Tiêu chí: Gold chỉ giữ các đặc trưng được cấu hình và loại bỏ cột không dùng cho huấn luyện.
 def test_apply_feature_selection_drops_configured_features():
     selected = gold_build.apply_feature_selection(_gold_ready_df())
 
@@ -46,6 +47,7 @@ def test_apply_feature_selection_drops_configured_features():
     assert set(gold_build.NUMERIC_FEATURES) <= set(selected.columns)
 
 
+# Tiêu chí: Gold phát hiện sớm giá trị thiếu trong đặc trưng số trước khi build dataset.
 def test_apply_feature_selection_fails_fast_on_numeric_nulls():
     df = _gold_ready_df()
     df.loc[0, "log_chars"] = None
@@ -54,6 +56,7 @@ def test_apply_feature_selection_fails_fast_on_numeric_nulls():
         gold_build.apply_feature_selection(df)
 
 
+# Tiêu chí: Chia train/val/test dùng đúng holdout month và không rò rỉ email_id giữa các tập.
 def test_split_dataset_uses_holdout_month_without_id_leak(monkeypatch):
     monkeypatch.setattr(gold_build, "VAL_SIZE", 0.5)
 
@@ -65,6 +68,7 @@ def test_split_dataset_uses_holdout_month_without_id_leak(monkeypatch):
     assert set(val["email_id"]).isdisjoint(test["email_id"])
 
 
+# Tiêu chí: TF-IDF và scaler chỉ fit trên train rồi transform nhất quán cho val/test.
 def test_build_features_fits_on_train_and_transforms_other_splits(monkeypatch):
     monkeypatch.setattr(
         gold_build,
@@ -85,6 +89,7 @@ def test_build_features_fits_on_train_and_transforms_other_splits(monkeypatch):
     assert x_test.shape[0] == 2
 
 
+# Tiêu chí: Artifact của Gold được lưu kèm metadata để truy vết snapshot và cấu hình feature.
 def test_save_artifacts_writes_metadata(tmp_path, monkeypatch):
     monkeypatch.setattr(
         gold_build,

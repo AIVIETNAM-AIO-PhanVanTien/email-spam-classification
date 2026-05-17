@@ -1,0 +1,136 @@
+# Airflow 3.x local dev stack — postgres metadata + apiserver + scheduler + dag-processor.
+#
+# Compose reads `.env` from the CWD (not next to this file), so always pass
+# `--env-file airflow/.env` or cd into airflow/ first:
+#
+#   cp airflow/.env.example airflow/.env    # then fill the 3 secrets
+#   docker compose --env-file airflow/.env -f airflow/docker-compose.yml up airflow-init
+#   docker compose --env-file airflow/.env -f airflow/docker-compose.yml up -d
+#
+# Cross-stack reload (Airflow → FastAPI in the serving stack) goes through
+# host.docker.internal:8000 — see EMAIL_SPAM_API_RELOAD_URL in airflow/.env.
+
+x-airflow-common: &airflow-common
+  build:
+    context: ..
+    dockerfile: airflow/Dockerfile
+  image: email-spam-airflow:3.0.4
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__API__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
+    # Airflow 3.x: task workers (supervisor) call back to the API server over HTTP.
+    # Must be reachable from the scheduler container, not localhost.
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.api_fastapi.auth.managers.simple.simple_auth_manager.SimpleAuthManager
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: admin:admin
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE: /opt/airflow/simple_auth_manager_passwords.json.generated
+    AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "10"
+    # Project-specific (consumed by DAG code via Variable.get / os.getenv)
+    EMAIL_SPAM_PROJECT_DIR: ${EMAIL_SPAM_PROJECT_DIR:-/opt/airflow}
+    EMAIL_SPAM_VENV_ACT: ${EMAIL_SPAM_VENV_ACT:-true}
+    EMAIL_SPAM_MODEL_DIR: ${EMAIL_SPAM_MODEL_DIR:-/opt/airflow/models}
+    EMAIL_SPAM_API_RELOAD_URL: ${EMAIL_SPAM_API_RELOAD_URL:-http://host.docker.internal:8000/admin/reload-model}
+    DRIFT_SCORE_THRESHOLD: ${DRIFT_SCORE_THRESHOLD:-0.25}
+    PROMOTION_F1_DELTA: ${PROMOTION_F1_DELTA:-0.0}
+    TARGET_PRECISION: ${TARGET_PRECISION:-0.99}
+    PYTHONPATH: /opt/airflow
+  volumes:
+    # DAG code
+    - ../dags:/opt/airflow/dags
+    # Project source — DAGs `python -m src.pipelines.monthly_run`
+    - ../src:/opt/airflow/src
+    - ../app:/opt/airflow/app
+    # Data + models + reports — Airflow writes; FastAPI (other compose) reads.
+    - ../data:/opt/airflow/data
+    - ../models:/opt/airflow/models
+    - ../reports:/opt/airflow/reports
+    - ../logs:/opt/airflow/project_logs
+    # Airflow's own logs + plugins
+    - airflow-logs:/opt/airflow/logs
+    # SimpleAuthManager admin/admin
+    - ./simple_auth_manager_passwords.json.generated:/opt/airflow/simple_auth_manager_passwords.json.generated
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: airflow-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    # `airflow db migrate` is the 3.x replacement for `airflow db init`.
+    # No `users create` step — SimpleAuthManager reads the JSON password file.
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        echo "[init] DB migrated. Admin login: admin / admin (see simple_auth_manager_passwords.json.generated)."
+    restart: "no"
+
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: airflow-apiserver
+    command: api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: airflow-dag-processor
+    command: dag-processor
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-data:
+  airflow-logs:

@@ -253,3 +253,6 @@ __marimo__/
 app/secrets/
 
 .DS_Store
+
+# Conquer kit (local-only LaTeX scaffold)
+AIConquer2026_Kit/

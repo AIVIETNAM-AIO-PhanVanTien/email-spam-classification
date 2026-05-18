@@ -38,12 +38,6 @@ _log_lock = threading.Lock()
 class EmailInput(BaseModel):
     subject: str = Field(default="", description="Email subject line")
     body: str = Field(default="", description="Email body text")
-    threshold: float | None = Field(
-        default=None,
-        ge=0.0,
-        le=1.0,
-        description="Optional per-request override of the spam threshold",
-    )
 
 
 class PredictionResponse(BaseModel):
@@ -129,7 +123,6 @@ def predict(payload: EmailInput) -> PredictionResponse:
     try:
         result = predict_spam(
             payload.subject, payload.body,
-            threshold=payload.threshold,
         )
     except FileNotFoundError as e:
         raise HTTPException(status_code=503, detail=str(e))
